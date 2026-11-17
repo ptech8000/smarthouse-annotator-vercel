@@ -83,7 +83,10 @@ function ensureAppReady() {
   return bootstrapPromise;
 }
 
-app.use('/api', async (_req, _res, next) => {
+app.use('/api', async (req, _res, next) => {
+  if (req.path === '/time' || req.path === '/health') {
+    return next();
+  }
   try {
     await ensureAppReady();
     next();
@@ -210,7 +213,7 @@ function clearAdminCookie(req, res) {
 
 function safeServerError(res, err, publicMessage = 'Internal server error') {
   console.error('[Server Error]', err);
-  if (err && err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+  if (err && err.statusCode && err.statusCode >= 400 && err.statusCode <= 503) {
     return res.status(err.statusCode).json({ error: err.message });
   }
   return res.status(500).json({ error: publicMessage });
@@ -229,6 +232,7 @@ app.get('/api/time', (_req, res) => {
 
 app.get('/api/health', async (_req, res) => {
   try {
+    await ensureAppReady();
     await db.ping();
     res.json({
       ok: true,
@@ -236,8 +240,12 @@ app.get('/api/health', async (_req, res) => {
       gitBackupConfigured: gitBackup.getConfig().configured,
       serverTime: Date.now()
     });
-  } catch {
-    res.status(503).json({ ok: false, error: 'Database unavailable' });
+  } catch (err) {
+    res.status(503).json({
+      ok: false,
+      error: err?.message || 'Database unavailable',
+      ...db.getStorageInfo()
+    });
   }
 });
 

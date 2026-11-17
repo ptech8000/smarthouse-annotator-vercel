@@ -3,9 +3,27 @@ const path = require('path');
 const { Pool } = require('pg');
 const { hashPassword, generateToken } = require('./security');
 
-const DATABASE_URL = typeof process.env.DATABASE_URL === 'string' && process.env.DATABASE_URL.trim()
-  ? process.env.DATABASE_URL.trim()
-  : '';
+function resolveDatabaseUrl() {
+  const candidates = [
+    process.env.DATABASE_URL,
+    process.env.POSTGRES_URL,
+    process.env.POSTGRES_PRISMA_URL,
+    process.env.POSTGRES_URL_NON_POOLING,
+    process.env.NEON_DATABASE_URL,
+    process.env.STORAGE_URL
+  ];
+  for (const raw of candidates) {
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      if (trimmed && !trimmed.startsWith('<') && /^postgres(ql)?:\/\//i.test(trimmed)) {
+        return trimmed;
+      }
+    }
+  }
+  return '';
+}
+
+const DATABASE_URL = resolveDatabaseUrl();
 const IS_POSTGRES = Boolean(DATABASE_URL);
 
 // Schema-level isolation for PostgreSQL: defaults to 'annotator_v2' on Vercel so data can never mix with 'public'.
@@ -188,9 +206,11 @@ async function initializeDatabase() {
     console.log(`[Database] Connected to PostgreSQL (schema "${PG_SCHEMA}").`);
   } else {
     if (process.env.VERCEL) {
-      throw new Error(
-        'DATABASE_URL environment variable is required when running on Vercel (local SQLite files are ephemeral in serverless functions).'
+      const err = new Error(
+        'PostgreSQL database not connected: set a valid DATABASE_URL (postgres://...) in Vercel Environment Variables (or attach Neon Postgres under Vercel Storage) and Redeploy.'
       );
+      err.statusCode = 503;
+      throw err;
     }
     const { DatabaseSync } = require('node:sqlite');
     if (!fs.existsSync(DATA_DIR)) {
