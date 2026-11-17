@@ -852,7 +852,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                 {filteredAnnotations.length === 0 ? (
                   <div className="empty-state-box">No annotations recorded for this filter in session "{currentSessionId}".</div>
                 ) : (
-                  <div className="table-responsive">
+                  <div className="table-responsive table-scroll-log">
                     <table className="ui-table">
                       <thead>
                         <tr>
