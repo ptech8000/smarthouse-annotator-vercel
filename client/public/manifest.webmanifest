@@ -1,0 +1,19 @@
+{
+  "name": "SmartHouse Annotator — Research Annotation Console",
+  "short_name": "Annotator",
+  "description": "Multi-resident smart home activity annotation console.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#090d16",
+  "theme_color": "#090d16",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

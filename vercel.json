@@ -1,0 +1,28 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "npm install && npm --prefix server install && npm --prefix client install --include=dev",
+  "buildCommand": "npm --prefix client run build",
+  "outputDirectory": "client/dist",
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
+  ],
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "{scenario,locations,activities,activities_location}.json",
+      "maxDuration": 30
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/backup/cron",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}

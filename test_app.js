@@ -1,0 +1,421 @@
+const assert = require('assert');
+const {
+  loadAndValidateConfig,
+  buildEnvironmentConfig,
+  buildEnvironmentExportPayload,
+  parseEnvironmentImportPayload
+} = require('./server/configPipeline');
+const db = require('./server/database');
+const gitBackup = require('./server/gitBackup');
+const { generateAnnotationsCsv } = require('./server/csvExport');
+const { hashPassword, verifyPassword, validateAnnotationPayload, validateSessionId } = require('./server/security');
+
+async function runTests() {
+  console.log('=== STARTING TEST SUITE ===');
+
+  // Test 1: Config Pipeline (Annotation-Only, no sensors object)
+  console.log('\n[1/10] Testing Config Pipeline...');
+  const cfg = loadAndValidateConfig();
+  assert.strictEqual(cfg.valid, true, 'Config must be valid');
+  assert.ok(cfg.hash, 'Hash must be generated');
+  assert.strictEqual(cfg.snapshot.roles.length, 3, 'Must have 3 roles');
+  assert.strictEqual(cfg.snapshot.locations.length, 11, 'Must have 11 locations');
+  assert.ok(cfg.snapshot.activities.length >= 19, 'Must have at least 19 activities');
+  assert.strictEqual(cfg.snapshot.sensors, undefined, 'Snapshot must not contain smartwatch sensor configuration');
+
+  const livingActs = cfg.snapshot.locationActivitiesMap[2];
+  assert.ok(livingActs.some(a => a.id === 19), 'Living must include vacuuming (id 19)');
+  const landingActs = cfg.snapshot.locationActivitiesMap[5];
+  assert.ok(landingActs.length > 0, 'Landing area must have activities mapped');
+  const bed1Acts = cfg.snapshot.locationActivitiesMap[6];
+  assert.ok(bed1Acts.length > 0, 'Bedroom 1 must have activities mapped');
+  console.log('✓ Config Pipeline passed all checks');
+
+  // Test 2: Database Operations & Idempotency
+  console.log('\n[2/10] Testing Database & Idempotency...');
+  await db.init();
+  assert.strictEqual(await db.ping(), true, 'Database ping must succeed');
+  const testSessionId = 'TEST_' + Date.now();
+  const session = await db.createSession(testSessionId, cfg.hash, cfg.snapshot, 'Europe/Paris');
+  assert.strictEqual(session.id, testSessionId);
+  assert.strictEqual(session.status, 'active');
+
+  const clientUuid = 'uuid_' + Date.now();
+  const annotationPayload = {
+    client_uuid: clientUuid,
+    session_id: testSessionId,
+    participant: 'Person_A',
+    timestamp_started: new Date(Date.now() - 5000).toISOString(),
+    timestamp_submitted: new Date().toISOString(),
+    location_id: 2,
+    location: 'living',
+    activity_id: 19,
+    activity: 'vacuuming living',
+    interaction: 'solo',
+    other_person: '',
+    edited: 0,
+    config_version: cfg.hash
+  };
+
+  const firstSave = await db.saveAnnotation(annotationPayload);
+  assert.strictEqual(firstSave.isDuplicate, false, 'First save must not be duplicate');
+  assert.strictEqual(firstSave.row.seq, 1, 'First annotation seq must be 1');
+
+  const secondSave = await db.saveAnnotation(annotationPayload);
+  assert.strictEqual(secondSave.isDuplicate, true, 'Duplicate save must be detected');
+  assert.strictEqual(secondSave.row.client_uuid, clientUuid);
+  console.log('✓ Database & Idempotency passed all checks');
+
+  // Test 3: PRD CSV Export Format
+  console.log('\n[3/10] Testing CSV Export...');
+  const annotations = await db.getAnnotations(testSessionId);
+  assert.strictEqual(annotations.length, 1);
+  const csv = generateAnnotationsCsv(annotations);
+  assert.ok(csv.startsWith('\uFEFF'), 'CSV must start with UTF-8 BOM');
+
+  const lines = csv.replace('\uFEFF', '').split('\r\n');
+  const expectedHeaders = 'session_id,participant,annotation_id,date,time_started,time_submitted,duration_sec,timezone,timestamp_submitted,timestamp_started,location_id,location,activity_id,activity,interaction,other_person,edited,config_version';
+  assert.strictEqual(lines[0], expectedHeaders);
+  assert.ok(lines[1].includes(testSessionId));
+  assert.ok(/\d{4}-\d{2}-\d{2},\d{2}:\d{2}:\d{2}\.\d{3}Z,\d{2}:\d{2}:\d{2}\.\d{3}Z/.test(lines[1]));
+  assert.ok(lines[1].includes('Person_A'));
+  assert.ok(lines[1].includes('vacuuming living'));
+  console.log('✓ CSV Export strictly matches event date/time + PRD §8');
+
+  // Test 4: Security Controls
+  console.log('\n[4/10] Testing Security Controls...');
+  const { hash, salt } = hashPassword('MySecurePass123!');
+  assert.strictEqual(verifyPassword('MySecurePass123!', hash, salt), true, 'Valid password must verify');
+  assert.strictEqual(verifyPassword('WrongPass', hash, salt), false, 'Wrong password must fail');
+
+  assert.strictEqual(validateSessionId('valid_Session-01').valid, true);
+  assert.strictEqual(validateSessionId('../bad!id').valid, false);
+
+  const selfLockAttempt = validateAnnotationPayload({
+    client_uuid: 'c-1',
+    session_id: testSessionId,
+    participant: 'Person_A',
+    timestamp_started: new Date(Date.now() - 2000).toISOString(),
+    timestamp_submitted: new Date().toISOString(),
+    location_id: 2,
+    activity_id: 19,
+    interaction: 'collaborative',
+    other_person: 'Person_A'
+  }, cfg.snapshot);
+  assert.strictEqual(selfLockAttempt.valid, false, 'Self-collaborator selection must be rejected');
+
+  const formulaCsv = generateAnnotationsCsv([{
+    ...annotations[0],
+    session_id: '=HYPERLINK("http://example.com")',
+    other_person: '+cmd|calc'
+  }]);
+  assert.ok(formulaCsv.includes("'=HYPERLINK"), 'CSV formula injection must be neutralized');
+
+  await db.deleteSession(testSessionId);
+  console.log('✓ Security controls passed all checks');
+
+  // Test 5: Custom Environment Creation & Session Binding
+  console.log('\n[5/10] Testing Custom Environment Creation...');
+  const builtEnv = buildEnvironmentConfig({
+    name: 'Rehab Kitchen Lab',
+    description: '2-participant clinic environment',
+    roles: ['Resident_1', 'Caregiver_1'],
+    locations: [
+      { name: 'Prep Station', shortLabel: 'Prep', activities: ['chopping vegetables', 'pouring tea'] },
+      { name: 'Dining Desk', shortLabel: 'Desk', activities: ['eating meal', 'pouring tea'] }
+    ]
+  });
+  assert.strictEqual(builtEnv.valid, true);
+  assert.strictEqual(builtEnv.snapshot.roles.length, 2);
+  assert.strictEqual(builtEnv.snapshot.locations.length, 2);
+  assert.strictEqual(builtEnv.snapshot.activities.length, 3);
+
+  const envId = 'env_test_' + Date.now();
+  const savedEnv = await db.createEnvironment({
+    id: envId,
+    name: builtEnv.name,
+    description: builtEnv.description,
+    configHash: builtEnv.hash,
+    configSnapshot: builtEnv.snapshot
+  });
+  assert.strictEqual(savedEnv.name, 'Rehab Kitchen Lab');
+
+  const customSessionId = 'ENV_SESS_' + Date.now();
+  const customSess = await db.createSession(
+    customSessionId,
+    savedEnv.config_hash,
+    savedEnv.snapshot,
+    'Europe/Paris',
+    savedEnv.id,
+    savedEnv.name
+  );
+  assert.strictEqual(customSess.environment_id, envId);
+
+  const customAnnCheck = validateAnnotationPayload({
+    client_uuid: 'env-uuid-' + Date.now(),
+    session_id: customSessionId,
+    participant: 'Resident_1',
+    timestamp_started: new Date(Date.now() - 3000).toISOString(),
+    timestamp_submitted: new Date().toISOString(),
+    location_id: savedEnv.snapshot.locations[0].id,
+    activity_id: savedEnv.snapshot.locationActivitiesMap[savedEnv.snapshot.locations[0].id][0].id,
+    interaction: 'assistive',
+    other_person: 'Caregiver_1'
+  }, savedEnv.snapshot);
+  assert.strictEqual(customAnnCheck.valid, true);
+
+  await db.deleteSession(customSessionId);
+  await db.deleteEnvironment(envId);
+  console.log('✓ Custom Environment creation & session binding passed all checks');
+
+  // Test 6: Unrestricted Multi-Person Pairing & Concurrent Sequence Safety
+  console.log('\n[6/10] Testing Unrestricted Multi-Person Pairing...');
+  const pairSessId = 'PAIR_TEST_' + Date.now();
+  await db.createSession(pairSessId, cfg.hash, cfg.snapshot, 'Europe/Paris');
+
+  const [pairAB, pairAC, pairCB] = await Promise.all([
+    db.saveAnnotation({
+      client_uuid: 'pair-ab-' + Date.now(),
+      session_id: pairSessId,
+      participant: 'Person_A',
+      timestamp_started: new Date(Date.now() - 4000).toISOString(),
+      timestamp_submitted: new Date().toISOString(),
+      location_id: 2,
+      location: 'living',
+      activity_id: 19,
+      activity: 'vacuuming living',
+      interaction: 'collaborative',
+      other_person: 'Person_B',
+      edited: 0,
+      config_version: cfg.hash
+    }),
+    db.saveAnnotation({
+      client_uuid: 'pair-ac-' + Date.now(),
+      session_id: pairSessId,
+      participant: 'Person_A',
+      timestamp_started: new Date(Date.now() - 3000).toISOString(),
+      timestamp_submitted: new Date().toISOString(),
+      location_id: 2,
+      location: 'living',
+      activity_id: 19,
+      activity: 'vacuuming living',
+      interaction: 'collaborative',
+      other_person: 'Person_C',
+      edited: 0,
+      config_version: cfg.hash
+    }),
+    db.saveAnnotation({
+      client_uuid: 'pair-cb-' + Date.now(),
+      session_id: pairSessId,
+      participant: 'Person_C',
+      timestamp_started: new Date(Date.now() - 2000).toISOString(),
+      timestamp_submitted: new Date().toISOString(),
+      location_id: 2,
+      location: 'living',
+      activity_id: 19,
+      activity: 'vacuuming living',
+      interaction: 'collaborative',
+      other_person: 'Person_B',
+      edited: 0,
+      config_version: cfg.hash
+    })
+  ]);
+  assert.strictEqual(pairAB.row.other_person, 'Person_B');
+  assert.strictEqual(pairAC.row.other_person, 'Person_C');
+  assert.strictEqual(pairCB.row.other_person, 'Person_B');
+  assert.notStrictEqual(pairAB.row.seq, pairAC.row.seq);
+  assert.strictEqual((await db.getSessionLocks(pairSessId)).length, 0);
+
+  const summaries = await db.getSessionSummaries();
+  const pairSummary = summaries.find(s => s.id === pairSessId);
+  assert.strictEqual(pairSummary.annotation_count, 3);
+  assert.strictEqual(pairSummary.chunk_count, undefined);
+
+  await db.deleteSession(pairSessId);
+  console.log('✓ Unrestricted multi-person pairing passed all checks');
+
+  // Test 7: Environment JSON Export & Upload/Import Round-Trip
+  console.log('\n[7/10] Testing Environment JSON Export & Import Round-Trip...');
+  const srcBuilt = buildEnvironmentConfig({
+    name: 'Smart Loft 4A',
+    description: 'Export/import verification layout',
+    roles: ['Roommate_A', 'Roommate_B', 'Assistant_A'],
+    locations: [
+      { name: 'Kitchen', shortLabel: 'Kitchen', activities: ['Preparing hot drink', 'Preparing meals'] },
+      { name: 'Living', shortLabel: 'Living', activities: ['Operating TV', 'Relaxing on couch'] }
+    ]
+  });
+  assert.strictEqual(srcBuilt.valid, true);
+  const exportedJson = buildEnvironmentExportPayload({
+    id: 'env_src',
+    name: srcBuilt.name,
+    description: srcBuilt.description,
+    config_hash: srcBuilt.hash,
+    snapshot: srcBuilt.snapshot
+  });
+  assert.strictEqual(exportedJson.format, 'smarthouse-environment-v1');
+  assert.strictEqual(exportedJson.sensors, undefined);
+
+  const importedDraft = parseEnvironmentImportPayload(exportedJson, 'Fallback');
+  const rebuilt = buildEnvironmentConfig(importedDraft);
+  assert.strictEqual(rebuilt.valid, true);
+  assert.strictEqual(rebuilt.name, 'Smart Loft 4A');
+  assert.deepStrictEqual(rebuilt.snapshot.roles, ['Roommate_A', 'Roommate_B', 'Assistant_A']);
+  assert.strictEqual(rebuilt.snapshot.locations.length, 2);
+  assert.strictEqual(rebuilt.snapshot.activities.length, 4);
+  console.log('✓ Environment JSON Export & Import round-trip passed all checks');
+
+  // Test 8: Solo-Only Activity Interaction Enforcement
+  console.log('\n[8/10] Testing Solo-Only Activity Interaction Enforcement...');
+  const toiletActs = cfg.snapshot.locationActivitiesMap[9];
+  const usingToilet = toiletActs.find(a => a.id === 11);
+  assert.ok(usingToilet && usingToilet.canDoTogether === false);
+
+  const rejectCollabOnToilet = validateAnnotationPayload({
+    client_uuid: 'solo-guard-' + Date.now(),
+    session_id: 'S_SOLO_TEST',
+    participant: 'Person_A',
+    timestamp_started: new Date(Date.now() - 2000).toISOString(),
+    timestamp_submitted: new Date().toISOString(),
+    location_id: 9,
+    activity_id: 11,
+    interaction: 'collaborative',
+    other_person: 'Person_B'
+  }, cfg.snapshot);
+  assert.strictEqual(rejectCollabOnToilet.valid, false);
+
+  const customRuleBuilt = buildEnvironmentConfig({
+    name: 'Clinic Suite',
+    roles: ['Resident_A', 'Nurse_1'],
+    locations: [
+      {
+        name: 'Bathroom',
+        activities: [
+          { name: 'bathing', allowedInteractions: ['solo'] },
+          { name: 'assisted wash', allowedInteractions: ['solo', 'assistive'] },
+          { name: 'group cleanup', allowedInteractions: ['solo', 'collaborative'] }
+        ]
+      }
+    ]
+  });
+  assert.strictEqual(customRuleBuilt.valid, true);
+  const washAct = customRuleBuilt.snapshot.locationActivitiesMap[0].find(a => a.name === 'assisted wash');
+  assert.deepStrictEqual(washAct.allowedInteractions, ['solo', 'assistive']);
+  console.log('✓ Solo/Collab/Assisted activity rules passed all checks');
+
+  // Test 9: Full Database Backup Export & Restore Round-Trip
+  console.log('\n[9/10] Testing Full Database Backup Export & Restore...');
+  const bkEnvBuilt = buildEnvironmentConfig({
+    name: 'Backup Verification Wing',
+    roles: ['Resident_X', 'Resident_Y'],
+    locations: [{ name: 'Study', activities: [{ name: 'reading', allowedInteractions: ['solo'] }] }]
+  });
+  const bkEnv = await db.createEnvironment({
+    id: 'env_bk_' + Date.now(),
+    name: bkEnvBuilt.name,
+    description: 'Backup check',
+    configHash: bkEnvBuilt.hash,
+    configSnapshot: bkEnvBuilt.snapshot
+  });
+  const bkSessId = 'BK_SESS_' + Date.now();
+  await db.createSession(bkSessId, bkEnv.config_hash, bkEnv.snapshot, 'Europe/Paris', bkEnv.id, bkEnv.name);
+  await db.ensureParticipantTokens(bkSessId, bkEnvBuilt.snapshot.roles);
+  const bkAnnUuid = 'bk-ann-' + Date.now();
+  await db.saveAnnotation({
+    client_uuid: bkAnnUuid,
+    session_id: bkSessId,
+    participant: 'Resident_X',
+    timestamp_started: new Date(Date.now() - 4000).toISOString(),
+    timestamp_submitted: new Date().toISOString(),
+    location_id: 0,
+    location: 'Study',
+    activity_id: 0,
+    activity: 'reading',
+    interaction: 'solo',
+    other_person: '',
+    edited: 0,
+    config_version: bkEnv.config_hash
+  });
+
+  const backupJson = await db.exportBackup();
+  assert.strictEqual(backupJson.format, 'smarthouse-backup-v1');
+  assert.strictEqual(backupJson.data.sensor_chunks, undefined);
+  assert.strictEqual(backupJson.data.wearables, undefined);
+  assert.ok(backupJson.data.sessions.some(s => s.id === bkSessId));
+  assert.ok(backupJson.data.annotations.some(a => a.client_uuid === bkAnnUuid));
+
+  await db.deleteSession(bkSessId);
+  await db.deleteEnvironment(bkEnv.id);
+  const restoreRes = await db.restoreBackup(backupJson);
+  assert.ok(restoreRes.sessionsAdded >= 1);
+  assert.ok(restoreRes.annotationsAdded >= 1);
+  assert.ok(restoreRes.environmentsAdded >= 1);
+
+  const secondRestore = await db.restoreBackup(backupJson);
+  assert.strictEqual(secondRestore.sessionsAdded, 0);
+  assert.strictEqual(secondRestore.annotationsAdded, 0);
+
+  await db.deleteSession(bkSessId);
+  await db.deleteEnvironment(bkEnv.id);
+  console.log('✓ Full Database Backup export & idempotent restore passed all checks');
+
+  // Test 10: Private GitHub Automated Backup Engine
+  console.log('\n[10/10] Testing Private GitHub Backup Engine...');
+  assert.deepStrictEqual(
+    gitBackup.parseRepoSlug('https://github.com/ptech8000/smarthouse-annotator-backups.git'),
+    { owner: 'ptech8000', repo: 'smarthouse-annotator-backups', slug: 'ptech8000/smarthouse-annotator-backups' }
+  );
+
+  await assert.rejects(
+    () =>
+      gitBackup.runBackupNow({
+        reason: 'test-public-guard',
+        force: true,
+        env: { GITHUB_BACKUP_REPO: 'ptech8000/SmartHouse-Studio', GITHUB_BACKUP_TOKEN: 'tok_test' },
+        exportBackupFn: () => db.exportBackup(),
+        fetchFn: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ private: false, default_branch: 'main' })
+        })
+      }),
+    /must.*PRIVATE|PUBLIC/i
+  );
+
+  const uploadedFiles = [];
+  const ghResult = await gitBackup.runBackupNow({
+    reason: 'test-private',
+    force: true,
+    env: { GITHUB_BACKUP_REPO: 'ptech8000/smarthouse-annotator-backups', GITHUB_BACKUP_TOKEN: 'tok_test' },
+    exportBackupFn: () => db.exportBackup(),
+    fetchFn: async (url, opts = {}) => {
+      if (opts.method === 'PUT') {
+        const body = JSON.parse(opts.body);
+        uploadedFiles.push({ url, message: body.message, branch: body.branch, contentLen: body.content.length });
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({ commit: { html_url: 'https://github.com/ptech8000/smarthouse-annotator-backups/commit/abc' } })
+        };
+      }
+      if (url.includes('/contents/')) {
+        return { ok: false, status: 404, text: async () => '{}' };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ private: true, default_branch: 'main' })
+      };
+    }
+  });
+  assert.strictEqual(ghResult.success, true);
+  assert.strictEqual(uploadedFiles.length, 2);
+  console.log('✓ Private GitHub backup safety checks passed');
+
+  console.log('\n🎉 ALL 10 TEST SUITES PASSED CLEANLY!\n');
+}
+
+runTests().catch(err => {
+  console.error('❌ Test failed:', err);
+  process.exit(1);
+});

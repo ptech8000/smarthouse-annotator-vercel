@@ -1,0 +1,1190 @@
+import React, { useState, useEffect, useRef } from 'react';
+import type {
+  SessionSummaryItem,
+  ConfigSnapshot,
+  StoredAnnotation,
+  EnvironmentItem,
+  EnvironmentDraftInput
+} from '../types';
+import type { MainTabType } from './AppHeader';
+import { EnvironmentBuilderModal, snapshotToDraft } from './EnvironmentBuilderModal';
+import { parseUploadedEnvironmentFiles } from '../utils/environmentJson';
+import { resolveAllowedInteractionKeys } from '../utils/interactions';
+import { useNotify } from './InAppNotifications';
+import {
+  getExportCsvUrl,
+  createSession,
+  startSession,
+  stopSession,
+  deleteSession,
+  reloadConfig,
+  generateTestAnnotation,
+  fetchSessionSummaries,
+  fetchNetworkInfo,
+  fetchParticipantLinks,
+  fetchEnvironments,
+  importEnvironmentJson,
+  downloadEnvironmentJson,
+  deleteEnvironment,
+  fetchStorageHealth,
+  downloadFullBackupJson,
+  restoreFullBackupJson,
+  fetchGitBackupStatus,
+  triggerGitBackupNow
+} from '../services/api';
+import type { GitBackupStatus } from '../services/api';
+import {
+  Download,
+  Upload,
+  Play,
+  Square,
+  RefreshCw,
+  PlusCircle,
+  Trash2,
+  ExternalLink,
+  Copy,
+  Radio,
+  CheckCircle2,
+  FileText,
+  Layers,
+  CopyPlus,
+  Database
+} from 'lucide-react';
+
+interface AdminConsoleProps {
+  currentSessionId: string;
+  activeTab: MainTabType;
+  onSelectSession: (sId: string) => void;
+  onTabChange?: (tab: MainTabType) => void;
+  currentParticipant: string;
+  onParticipantChange: (p: string) => void;
+  config: ConfigSnapshot | null;
+  annotations: StoredAnnotation[];
+  onRefreshData: () => void;
+  mustChangePassword?: boolean;
+  onOpenPasswordModal?: () => void;
+}
+
+export const AdminConsole: React.FC<AdminConsoleProps> = ({
+  currentSessionId,
+  activeTab,
+  onSelectSession,
+  onTabChange,
+  currentParticipant,
+  onParticipantChange,
+  config,
+  annotations,
+  onRefreshData,
+  mustChangePassword = false,
+  onOpenPasswordModal
+}) => {
+  const { notify, confirmDialog } = useNotify();
+  const [sessions, setSessions] = useState<SessionSummaryItem[]>([]);
+  const [environments, setEnvironments] = useState<EnvironmentItem[]>([]);
+  const [selectedEnvId, setSelectedEnvId] = useState<string>('default-smart-house');
+  const [showEnvBuilder, setShowEnvBuilder] = useState<boolean>(false);
+  const [envBuilderDraft, setEnvBuilderDraft] = useState<EnvironmentDraftInput | null>(null);
+  const [newSessionId, setNewSessionId] = useState('');
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [filterParticipant, setFilterParticipant] = useState<string>('ALL');
+  const [netInfo, setNetInfo] = useState<{ hostIp: string; protocol?: string; localUrl: string; networkUrl: string } | null>(null);
+  const [participantTokens, setParticipantTokens] = useState<Record<string, string>>({});
+  const [storageHealth, setStorageHealth] = useState<{ engine: string; persistent: boolean; schema?: string } | null>(null);
+  const [gitBackupStatus, setGitBackupStatus] = useState<GitBackupStatus | null>(null);
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [isRestoringBackup, setIsRestoringBackup] = useState(false);
+  const [isPushingGitBackup, setIsPushingGitBackup] = useState(false);
+  const directJsonInputRef = useRef<HTMLInputElement | null>(null);
+  const backupInputRef = useRef<HTMLInputElement | null>(null);
+
+  const showFeedback = (msg: string, variant: 'success' | 'error' | 'warning' | 'info' = 'success', title?: string) => {
+    notify(msg, variant, title);
+  };
+
+  const loadSessions = async () => {
+    try {
+      const list = await fetchSessionSummaries();
+      setSessions(list);
+    } catch (e) {
+      console.warn('Failed to load session summaries:', e);
+    }
+  };
+
+  const loadEnvironments = async () => {
+    try {
+      const envs = await fetchEnvironments();
+      setEnvironments(envs);
+      if (envs.length > 0 && !envs.some(e => e.id === selectedEnvId)) {
+        setSelectedEnvId(envs[0].id);
+      }
+    } catch (e) {
+      console.warn('Failed to load environments:', e);
+    }
+  };
+
+  useEffect(() => {
+    loadSessions();
+    loadEnvironments();
+    fetchNetworkInfo().then(setNetInfo).catch(() => {});
+    fetchStorageHealth()
+      .then(h => setStorageHealth({ engine: h.engine, persistent: h.persistent, schema: h.schema }))
+      .catch(() => {});
+    fetchGitBackupStatus().then(setGitBackupStatus).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!currentSessionId) {
+      setParticipantTokens({});
+      return;
+    }
+    fetchParticipantLinks(currentSessionId)
+      .then(res => setParticipantTokens(res.tokens || {}))
+      .catch(() => setParticipantTokens({}));
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      loadSessions();
+    }, 3000);
+    return () => clearInterval(t);
+  }, []);
+
+  const handleCreateSession = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newSessionId.trim()) return;
+    try {
+      setIsCreatingSession(true);
+      const created = await createSession(newSessionId.trim(), 'Europe/Paris', selectedEnvId);
+      setNewSessionId('');
+      showFeedback(
+        `Session "${created.id}" created using "${created.environment_name || 'Default Smart House'}"!`,
+        'success',
+        'Session Created'
+      );
+      await loadSessions();
+      onSelectSession(created.id);
+      onRefreshData();
+    } catch (err: any) {
+      showFeedback(`Error creating session: ${err.message}`, 'error', 'Create Session Failed');
+    } finally {
+      setIsCreatingSession(false);
+    }
+  };
+
+  const handleDeleteEnvironment = async (env: EnvironmentItem) => {
+    const confirmed = await confirmDialog({
+      title: `Delete Environment "${env.name}"?`,
+      message: `Existing sessions already using this environment keep their frozen configuration snapshot, but "${env.name}" will be removed from the environment selector.`,
+      confirmLabel: 'Delete Environment',
+      cancelLabel: 'Cancel',
+      variant: 'danger'
+    });
+    if (!confirmed) return;
+
+    try {
+      await deleteEnvironment(env.id);
+      showFeedback(`Environment "${env.name}" deleted.`, 'info', 'Environment Deleted');
+      if (selectedEnvId === env.id) {
+        setSelectedEnvId('default-smart-house');
+      }
+      await loadEnvironments();
+    } catch (err: any) {
+      showFeedback(`Error deleting environment: ${err.message}`, 'error', 'Delete Failed');
+    }
+  };
+
+  const handleDownloadEnvironmentJson = async (envId: string, envName?: string) => {
+    try {
+      const filename = await downloadEnvironmentJson(envId, envName);
+      showFeedback(`Downloaded ${filename}`, 'success', 'Environment JSON Exported');
+    } catch (err: any) {
+      showFeedback(`Failed to download environment JSON: ${err.message}`, 'error', 'Export Failed');
+    }
+  };
+
+  const handleDirectImportJson = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    try {
+      const { draft, sourceLabel } = await parseUploadedEnvironmentFiles(files);
+      const created = await importEnvironmentJson(draft);
+      await loadEnvironments();
+      setSelectedEnvId(created.id);
+      showFeedback(
+        `Environment "${created.name}" created from ${sourceLabel} and selected!`,
+        'success',
+        'Environment Imported'
+      );
+    } catch (err: any) {
+      showFeedback(`Import failed: ${err.message}`, 'error', 'JSON Import Failed');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleStartSession = async (sId: string) => {
+    try {
+      await startSession(sId);
+      showFeedback(`Session "${sId}" started! Recording is now active.`, 'success', 'Session Started');
+      await loadSessions();
+      onRefreshData();
+    } catch (err: any) {
+      showFeedback(`Error starting session: ${err.message}`, 'error', 'Start Failed');
+    }
+  };
+
+  const handleStopSession = async (sId: string) => {
+    try {
+      await stopSession(sId);
+      showFeedback(`Session "${sId}" stopped! Participant screens locked.`, 'warning', 'Session Stopped');
+      await loadSessions();
+      onRefreshData();
+    } catch (err: any) {
+      showFeedback(`Error stopping session: ${err.message}`, 'error', 'Stop Failed');
+    }
+  };
+
+  const handleDownloadFullBackup = async () => {
+    try {
+      setIsBackingUp(true);
+      const filename = await downloadFullBackupJson();
+      showFeedback(`Downloaded complete database backup "${filename}"!`, 'success', 'Backup Downloaded');
+    } catch (err: any) {
+      showFeedback(`Backup failed: ${err.message}`, 'error', 'Backup Failed');
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
+  const handleRestoreBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      setIsRestoringBackup(true);
+      const raw = JSON.parse(await file.text());
+      const res = await restoreFullBackupJson(raw);
+      const s = res.summary;
+      showFeedback(
+        `Restored ${s.sessionsAdded} session(s), ${s.annotationsAdded} annotation(s), ${s.environmentsAdded} environment(s).`,
+        'success',
+        'Backup Restored'
+      );
+      await loadEnvironments();
+      await loadSessions();
+      onRefreshData();
+    } catch (err: any) {
+      showFeedback(`Restore failed: ${err.message}`, 'error', 'Restore Failed');
+    } finally {
+      setIsRestoringBackup(false);
+      e.target.value = '';
+    }
+  };
+
+  const handlePushGitBackupNow = async () => {
+    try {
+      setIsPushingGitBackup(true);
+      const res = await triggerGitBackupNow();
+      showFeedback(
+        res.skipped
+          ? `Private Git repo "${res.repo}" is already up to date.`
+          : `Backed up ${res.counts?.sessions ?? 0} sessions and ${res.counts?.annotations ?? 0} annotations to "${res.repo}".`,
+        'success',
+        'Private Git Backup Saved'
+      );
+      fetchGitBackupStatus().then(setGitBackupStatus).catch(() => {});
+    } catch (err: any) {
+      showFeedback(`Private Git backup error: ${err.message}`, 'error', 'Backup Failed');
+      fetchGitBackupStatus().then(setGitBackupStatus).catch(() => {});
+    } finally {
+      setIsPushingGitBackup(false);
+    }
+  };
+
+  const handleDeleteSession = async (sId: string) => {
+    const confirmed = await confirmDialog({
+      title: `Delete Session "${sId}"?`,
+      message: `This will permanently delete session "${sId}" and all of its stored annotations and participant invite links.`,
+      confirmLabel: 'Delete Session',
+      cancelLabel: 'Cancel',
+      variant: 'danger'
+    });
+    if (!confirmed) return;
+
+    try {
+      await deleteSession(sId);
+      showFeedback(`Session "${sId}" deleted.`, 'info', 'Session Deleted');
+      await loadSessions();
+      const remaining = sessions.filter(s => s.id !== sId);
+      if (currentSessionId === sId) {
+        onSelectSession(remaining.length > 0 ? remaining[0].id : '');
+      }
+      onRefreshData();
+    } catch (err: any) {
+      showFeedback(`Error deleting session: ${err.message}`, 'error', 'Delete Failed');
+    }
+  };
+
+  const handleReloadConfig = async () => {
+    try {
+      const res = await reloadConfig();
+      showFeedback(`Config reloaded (Hash: ${res.hash.substring(0, 8)})`, 'success', 'Config Reloaded');
+      await loadEnvironments();
+      onRefreshData();
+    } catch (err: any) {
+      showFeedback(`Error reloading config: ${err.message}`, 'error', 'Reload Failed');
+    }
+  };
+
+  const handleQuickInjectAnnotation = async (locId: number, actId: number, interaction = 'solo') => {
+    if (!config) return;
+    try {
+      const loc = config.locations.find(l => l.id === locId) || config.locations[0];
+      const validActs = config.locationActivitiesMap[loc.id] || config.activities;
+      const act = validActs.find(a => a.id === actId) || validActs[0];
+      const otherPerson = interaction !== 'solo' ? (config.roles.find(r => r !== currentParticipant) || '') : '';
+      const resolvedInteraction = otherPerson ? interaction : 'solo';
+
+      await generateTestAnnotation({
+        session_id: currentSessionId,
+        participant: currentParticipant,
+        location_id: loc.id,
+        activity_id: act.id,
+        interaction: resolvedInteraction,
+        other_person: otherPerson
+      });
+
+      showFeedback(`Injected test: ${loc.shortLabel} / ${act.shortLabel} (${currentParticipant})`, 'success', 'Test Annotation Saved');
+      onRefreshData();
+      await loadSessions();
+    } catch (err: any) {
+      showFeedback(`Error generating test annotation: ${err.message}`, 'error', 'Injection Failed');
+    }
+  };
+
+  const buildParticipantQuery = (role: string) => {
+    const tok = participantTokens[role];
+    const base = `/?role=${encodeURIComponent(role)}&session=${encodeURIComponent(currentSessionId)}`;
+    return tok ? `${base}&token=${encodeURIComponent(tok)}` : base;
+  };
+
+  const openParticipantTab = (role: string) => {
+    window.open(buildParticipantQuery(role), '_blank');
+  };
+
+  const openAllParticipantTabs = () => {
+    (config?.roles || ['Person_A', 'Person_B', 'Person_C']).forEach(r => openParticipantTab(r));
+  };
+
+  const copyToClipboard = (text: string, label: string) => {
+    navigator.clipboard.writeText(text);
+    showFeedback(`Copied ${label} link to clipboard!`);
+  };
+
+  const roles = config?.roles || ['Person_A', 'Person_B', 'Person_C'];
+  const activeSessionObj = sessions.find(s => s.id === currentSessionId);
+  const isSessionActive = activeSessionObj?.status === 'active';
+
+  const filteredAnnotations = filterParticipant === 'ALL'
+    ? annotations
+    : annotations.filter(a => a.participant === filterParticipant);
+
+  return (
+    <div className="admin-console-pro">
+      <input
+        ref={directJsonInputRef}
+        type="file"
+        accept=".json,application/json"
+        multiple
+        className="hidden-file-input"
+        onChange={handleDirectImportJson}
+      />
+      <input
+        ref={backupInputRef}
+        type="file"
+        accept=".json,application/json"
+        className="hidden-file-input"
+        onChange={handleRestoreBackupFile}
+      />
+      {mustChangePassword && (
+        <div className="default-pw-banner" role="alert">
+          <div>
+            <strong>Security Notice:</strong> Default admin password is still active. Please set a custom password for your deployment.
+          </div>
+          {onOpenPasswordModal && (
+            <button type="button" className="btn-ui btn-ui-amber" onClick={onOpenPasswordModal}>
+              Change Password Now
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Top Hero Banner */}
+      <div className="admin-hero-card">
+        <div className="hero-left-col">
+          <div className="hero-tag-row">
+            <span className="hero-eyebrow">ACTIVE EXPERIMENT SESSION</span>
+            <span className={`status-pill ${isSessionActive ? 'pill-active' : 'pill-ended'}`}>
+              {!activeSessionObj ? '○ NO SESSION' : isSessionActive ? '● RUNNING' : '■ STOPPED'}
+            </span>
+            <span className="env-pill-badge">
+              <Layers size={12} /> {activeSessionObj?.environment_name || 'Default Smart House'}
+            </span>
+            <span className="live-poll-badge">
+              <Radio size={12} className="live-pulse-icon" /> Live Sync Active
+            </span>
+          </div>
+          <h2 className="hero-session-name">{activeSessionObj ? currentSessionId : 'No Active Session'}</h2>
+          <div className="hero-meta-row">
+            <span>Started: <strong>{activeSessionObj ? new Date(activeSessionObj.started_at).toLocaleTimeString() : '—'}</strong></span>
+            <span>•</span>
+            <span>Environment: <strong>{activeSessionObj?.environment_name || 'Default Smart House'}</strong></span>
+            <span>•</span>
+            <span>Annotations: <strong>{activeSessionObj ? (activeSessionObj.annotation_count ?? annotations.length) : 0}</strong></span>
+          </div>
+        </div>
+
+        <div className="hero-right-col">
+          {activeSessionObj && (isSessionActive ? (
+            <button
+              className="btn-hero btn-hero-stop"
+              onClick={() => handleStopSession(currentSessionId)}
+              title="Stop and lock session recording"
+            >
+              <Square size={18} />
+              <span>Stop Session</span>
+            </button>
+          ) : (
+            <button
+              className="btn-hero btn-hero-start"
+              onClick={() => handleStartSession(currentSessionId)}
+              title="Start / Resume session recording"
+            >
+              <Play size={18} />
+              <span>Start Session</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* MODULE 1: SESSIONS & LIVE PARTICIPANT URLS */}
+      {activeTab === 'sessions' && (
+        <div className="tab-module-content">
+          <section className="pro-section">
+            <div className="section-head-pro">
+              <div>
+                <h3>1. Create &amp; Manage Experiment Sessions</h3>
+                <p>Pick an environment (or create a new one), launch a session, and share the generated participant URLs below</p>
+              </div>
+              <div className="section-head-actions">
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-soft-blue"
+                  onClick={() => {
+                    setEnvBuilderDraft(null);
+                    setShowEnvBuilder(true);
+                  }}
+                >
+                  <Layers size={14} />
+                  <span>New Environment</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-secondary"
+                  onClick={() => directJsonInputRef.current?.click()}
+                  title="Upload an exported .json file to create a new environment right away"
+                >
+                  <Upload size={14} />
+                  <span>Import JSON</span>
+                </button>
+                <button className="btn-ui btn-ui-secondary" onClick={() => { loadSessions(); loadEnvironments(); onRefreshData(); }}>
+                  <RefreshCw size={14} />
+                  <span>Refresh</span>
+                </button>
+              </div>
+            </div>
+
+            <form onSubmit={handleCreateSession} className="session-create-bar">
+              <input
+                type="text"
+                placeholder="Enter new Session ID (e.g. S002, PILOT_01)..."
+                value={newSessionId}
+                onChange={e => setNewSessionId(e.target.value)}
+                className="ui-input"
+              />
+              <select
+                className="ui-select env-select-input"
+                value={selectedEnvId}
+                onChange={e => setSelectedEnvId(e.target.value)}
+                aria-label="Select environment for new session"
+              >
+                {environments.length === 0 ? (
+                  <option value="default-smart-house">Default Smart House</option>
+                ) : (
+                  environments.map(env => (
+                    <option key={env.id} value={env.id}>
+                      {env.name} ({env.snapshot?.roles?.length || 0} roles, {env.snapshot?.locations?.length || 0} rooms)
+                    </option>
+                  ))
+                )}
+              </select>
+              <button
+                type="button"
+                className="btn-ui btn-ui-secondary"
+                onClick={() => {
+                  const chosen = environments.find(env => env.id === selectedEnvId);
+                  handleDownloadEnvironmentJson(selectedEnvId, chosen?.name);
+                }}
+                title="Download JSON file for the selected environment"
+              >
+                <Download size={15} />
+                <span>Download JSON</span>
+              </button>
+              <button type="submit" className="btn-ui btn-ui-primary" disabled={isCreatingSession}>
+                <PlusCircle size={16} />
+                <span>Create Session</span>
+              </button>
+            </form>
+
+            <div className="table-responsive">
+              <table className="ui-table">
+                <thead>
+                  <tr>
+                    <th>Session ID</th>
+                    <th>Environment</th>
+                    <th>Status</th>
+                    <th>Started</th>
+                    <th>Annotations</th>
+                    <th>Active Residents</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sessions.length === 0 ? (
+                    <tr>
+                      <td colSpan={7}>
+                        <div className="empty-state-box">
+                          No experiment sessions created yet. Choose an environment above and click <strong>Create Session</strong> when you are ready.
+                        </div>
+                      </td>
+                    </tr>
+                  ) : sessions.map(s => {
+                    const isSelected = s.id === currentSessionId;
+                    return (
+                      <tr key={s.id} className={isSelected ? 'row-selected' : ''}>
+                        <td>
+                          <div className="session-id-cell">
+                            <strong>{s.id}</strong>
+                            {isSelected && <span className="current-badge">ACTIVE TARGET</span>}
+                          </div>
+                        </td>
+                        <td>
+                          <span className="badge-env-cell">
+                            <Layers size={12} /> {s.environment_name || 'Default Smart House'}
+                          </span>
+                        </td>
+                        <td>
+                          <span className={`status-pill ${s.status === 'active' ? 'pill-active' : 'pill-ended'}`}>
+                            {s.status === 'active' ? '● active' : '■ stopped'}
+                          </span>
+                        </td>
+                        <td>{new Date(s.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</td>
+                        <td><strong>{s.annotation_count ?? 0}</strong></td>
+                        <td>{s.active_participants || '—'}</td>
+                        <td>
+                          <div className="table-action-group">
+                            {!isSelected && (
+                              <button
+                                className="btn-table btn-table-select"
+                                onClick={() => {
+                                  onSelectSession(s.id);
+                                  showFeedback(`Switched target to session "${s.id}"`);
+                                }}
+                              >
+                                Select
+                              </button>
+                            )}
+
+                            {s.status === 'active' ? (
+                              <button
+                                className="btn-table btn-table-stop"
+                                onClick={() => handleStopSession(s.id)}
+                              >
+                                <Square size={12} /> Stop
+                              </button>
+                            ) : (
+                              <button
+                                className="btn-table btn-table-start"
+                                onClick={() => handleStartSession(s.id)}
+                              >
+                                <Play size={12} /> Start
+                              </button>
+                            )}
+
+                            <a
+                              href={getExportCsvUrl(s.id)}
+                              download={`${s.id}_all.csv`}
+                              className="btn-table btn-table-csv"
+                            >
+                              <Download size={12} /> CSV
+                            </a>
+
+                            <button
+                              className="btn-table btn-table-delete"
+                              onClick={() => handleDeleteSession(s.id)}
+                              title="Delete session"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="pro-section multi-user-hub">
+            <div className="section-head-pro">
+              <div>
+                <h3>2. Live Participant URLs {activeSessionObj ? `for Session "${currentSessionId}"` : ''}</h3>
+                <p>Share each participant's dedicated link below so they can join from any device or network (mobile data, Wi-Fi, tablet, or desktop)</p>
+              </div>
+              {activeSessionObj && (
+                <button className="btn-ui btn-ui-accent" onClick={openAllParticipantTabs}>
+                  <ExternalLink size={15} />
+                  <span>Open All {roles.length} Participant Tabs</span>
+                </button>
+              )}
+            </div>
+
+            {!activeSessionObj ? (
+              <div className="empty-state-box">
+                Create or select a session in Section 1 above to generate tokenized participant invite links.
+              </div>
+            ) : (
+              <div className="participant-launch-grid">
+                {roles.map(role => {
+                  const queryPath = buildParticipantQuery(role);
+                  const liveBaseUrl = netInfo?.networkUrl || window.location.origin;
+                  const participantUrl = `${liveBaseUrl}${queryPath}`;
+                  return (
+                    <div key={role} className="participant-launch-card">
+                      <div className="launch-card-header">
+                        <div className="launch-role-badge">{role}</div>
+                        <button
+                          className="btn-ui btn-ui-soft-blue"
+                          onClick={() => openParticipantTab(role)}
+                        >
+                          <span>Open Tab</span>
+                          <ExternalLink size={13} />
+                        </button>
+                      </div>
+
+                      <div className="launch-url-group">
+                        <span className="url-type-label">Participant Access URL:</span>
+                        <div className="launch-url-box">
+                          <span className="launch-url-text">{participantUrl}</span>
+                          <button
+                            className="btn-copy-icon"
+                            onClick={() => copyToClipboard(participantUrl, role)}
+                            title={`Copy ${role} URL`}
+                          >
+                            <Copy size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* MODULE 2: LIVE DATA FEED & CSV EXPORTS */}
+      {activeTab === 'data' && (
+        <div className="tab-module-content">
+          {!activeSessionObj ? (
+            <section className="pro-section">
+              <div className="empty-state-box">
+                No session selected yet. Create a session in the <strong>Sessions &amp; Live URLs</strong> tab to view annotations, inject test records, or export CSV datasets.
+              </div>
+            </section>
+          ) : (
+            <>
+              <section className="pro-section">
+                <div className="section-head-pro">
+                  <div>
+                    <h3>Export PRD-Compliant CSV Datasets</h3>
+                    <p>Download Excel-ready datasets (UTF-8 BOM, local Date, Start &amp; Submit Times, Duration, and PRD §8 columns)</p>
+                  </div>
+                </div>
+
+                <div className="export-cards-row">
+                  <a
+                    href={getExportCsvUrl(currentSessionId)}
+                    download={`${currentSessionId}_all.csv`}
+                    className="export-box-card export-box-combined"
+                  >
+                    <div className="export-icon-circle combined-circle">
+                      <Download size={22} />
+                    </div>
+                    <div>
+                      <div className="export-box-title">{currentSessionId}_all.csv</div>
+                      <div className="export-box-desc">All {roles.length} participants together sorted by timestamp</div>
+                    </div>
+                  </a>
+
+                  {roles.map(role => (
+                    <a
+                      key={role}
+                      href={getExportCsvUrl(currentSessionId, role)}
+                      download={`${currentSessionId}_${role}.csv`}
+                      className="export-box-card export-box-individual"
+                    >
+                      <div className="export-icon-circle individual-circle">
+                        <Download size={18} />
+                      </div>
+                      <div>
+                        <div className="export-box-title">{currentSessionId}_{role}.csv</div>
+                        <div className="export-box-desc">Individual records only</div>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              </section>
+
+              <section className="pro-section">
+                <div className="section-head-pro">
+                  <div>
+                    <h3>Quick Test Annotation Injector</h3>
+                    <p>Instantly inject simulated annotations into session "{currentSessionId}" to verify data feeds &amp; exports</p>
+                  </div>
+                  <div className="participant-select-inline">
+                    <span className="role-select-label">Inject As:</span>
+                    {roles.map(r => (
+                      <button
+                        key={r}
+                        className={`role-tab-btn ${currentParticipant === r ? 'active' : ''}`}
+                        onClick={() => onParticipantChange(r)}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="quick-inject-buttons">
+                  {(() => {
+                    const samples: Array<{ locId: number; actId: number; label: string; interaction: string }> = [];
+                    let firstCollabSample: { locId: number; actId: number; label: string } | null = null;
+                    for (const loc of config?.locations || []) {
+                      const acts = config?.locationActivitiesMap?.[loc.id] || [];
+                      for (const act of acts) {
+                        const baseLabel = `+ ${loc.shortLabel || loc.name}: ${act.shortLabel || act.name}`;
+                        const allowedKeys = resolveAllowedInteractionKeys(act);
+                        if (!firstCollabSample && allowedKeys.includes('collaborative')) {
+                          firstCollabSample = { locId: loc.id, actId: act.id, label: baseLabel };
+                        }
+                        if (samples.length < 5) {
+                          const sampleKey = allowedKeys.includes('solo') ? 'solo' : allowedKeys[0];
+                          const shortTag = sampleKey === 'collaborative' ? 'Collab' : sampleKey === 'assistive' ? 'Assisted' : 'Solo';
+                          samples.push({
+                            locId: loc.id,
+                            actId: act.id,
+                            label: `${baseLabel} (${shortTag})`,
+                            interaction: sampleKey
+                          });
+                        }
+                      }
+                      if (samples.length >= 5 && firstCollabSample) break;
+                    }
+                    if (firstCollabSample && roles.length >= 2) {
+                      samples.push({
+                        locId: firstCollabSample.locId,
+                        actId: firstCollabSample.actId,
+                        label: `${firstCollabSample.label} (Collab)`,
+                        interaction: 'collaborative'
+                      });
+                    }
+                    return samples.map((item, idx) => (
+                      <button
+                        key={`${item.locId}-${item.actId}-${item.interaction}-${idx}`}
+                        className="btn-quick-inject"
+                        onClick={() => handleQuickInjectAnnotation(item.locId, item.actId, item.interaction)}
+                      >
+                        {item.label}
+                      </button>
+                    ));
+                  })()}
+                </div>
+              </section>
+
+              <section className="pro-section">
+                <div className="section-head-pro">
+                  <div>
+                    <h3>Real-Time Session Annotations Log ({filteredAnnotations.length})</h3>
+                    <p>Live incoming participant records for session "{currentSessionId}"</p>
+                  </div>
+
+                  <div className="filter-pill-row">
+                    <button
+                      className={`filter-pill ${filterParticipant === 'ALL' ? 'active' : ''}`}
+                      onClick={() => setFilterParticipant('ALL')}
+                    >
+                      All ({annotations.length})
+                    </button>
+                    {roles.map(r => (
+                      <button
+                        key={r}
+                        className={`filter-pill ${filterParticipant === r ? 'active' : ''}`}
+                        onClick={() => setFilterParticipant(r)}
+                      >
+                        {r} ({annotations.filter(a => a.participant === r).length})
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {filteredAnnotations.length === 0 ? (
+                  <div className="empty-state-box">No annotations recorded for this filter in session "{currentSessionId}".</div>
+                ) : (
+                  <div className="table-responsive">
+                    <table className="ui-table">
+                      <thead>
+                        <tr>
+                          <th>Seq #</th>
+                          <th>Participant</th>
+                          <th>Date</th>
+                          <th>Started</th>
+                          <th>Stopped</th>
+                          <th>Duration</th>
+                          <th>Location</th>
+                          <th>Activity</th>
+                          <th>Interaction</th>
+                          <th>Other Person</th>
+                          <th>Edited</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...filteredAnnotations].reverse().map((a, i) => {
+                          const startMs = a.timestamp_started ? Date.parse(a.timestamp_started) : NaN;
+                          const stopMs = a.timestamp_submitted ? Date.parse(a.timestamp_submitted) : NaN;
+                          const durSec = !Number.isNaN(startMs) && !Number.isNaN(stopMs)
+                            ? `${Math.max(0, (stopMs - startMs) / 1000).toFixed(1)}s`
+                            : '—';
+                          return (
+                            <tr key={a.client_uuid || i}>
+                              <td><strong>{a.seq || filteredAnnotations.length - i}</strong></td>
+                              <td><span className="badge-participant">{a.participant}</span></td>
+                              <td><span className="mono-time">{a.timestamp_submitted ? new Date(a.timestamp_submitted).toLocaleDateString() : '—'}</span></td>
+                              <td><span className="mono-time">{a.timestamp_started ? new Date(a.timestamp_started).toLocaleTimeString() : '—'}</span></td>
+                              <td><span className="mono-time">{a.timestamp_submitted ? new Date(a.timestamp_submitted).toLocaleTimeString() : '—'}</span></td>
+                              <td><span className="mono-time">{durSec}</span></td>
+                              <td>{a.location}</td>
+                              <td><strong>{a.activity}</strong></td>
+                              <td><span className="badge-interaction">{a.interaction}</span></td>
+                              <td>{a.other_person ? <span className="badge-other-person">{a.other_person}</span> : '—'}</td>
+                              <td>{a.edited ? 'Yes' : 'No'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* MODULE 3: ENVIRONMENTS, DATABASE BACKUPS & CONFIGURATION INTEGRITY */}
+      {activeTab === 'config' && (
+        <div className="tab-module-content">
+          <section className="pro-section">
+            <div className="section-head-pro">
+              <div>
+                <h3>
+                  <Database size={16} style={{ verticalAlign: '-2px', marginRight: 6 }} />
+                  Database Storage &amp; Full Backup
+                </h3>
+                <p>
+                  Active storage:{' '}
+                  <strong>
+                    {storageHealth?.engine === 'postgresql'
+                      ? `PostgreSQL (Isolated schema "${storageHealth.schema || 'public'}")`
+                      : storageHealth?.engine === 'sqlite'
+                        ? (storageHealth.persistent ? 'SQLite (Persistent Disk)' : 'Local SQLite')
+                        : 'Checking...'}
+                  </strong>{' '}
+                  • Download a complete portable snapshot of all sessions, annotations, custom environments, and invite tokens, or restore anytime.
+                </p>
+              </div>
+              <div className="section-head-actions">
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-secondary"
+                  disabled={isRestoringBackup}
+                  onClick={() => backupInputRef.current?.click()}
+                  title="Restore sessions, environments, and annotations from a smarthouse-backup .json file"
+                >
+                  <Upload size={15} />
+                  <span>{isRestoringBackup ? 'Restoring...' : 'Restore Backup (.json)'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-primary"
+                  disabled={isBackingUp}
+                  onClick={handleDownloadFullBackup}
+                  title="Download full database backup JSON (all sessions, environments, annotations, invite tokens)"
+                >
+                  <Download size={15} />
+                  <span>{isBackingUp ? 'Preparing...' : 'Download Full Backup (.json)'}</span>
+                </button>
+              </div>
+            </div>
+
+            <div className={`git-backup-panel ${gitBackupStatus?.configured ? 'is-configured' : 'is-unconfigured'}`}>
+              <div className="git-backup-info">
+                <div className="git-backup-title-row">
+                  <strong>Automatic Private GitHub Backup:</strong>
+                  <span className={`status-pill ${gitBackupStatus?.configured ? 'pill-active' : 'pill-ended'}`}>
+                    {gitBackupStatus?.configured ? '● AUTO-BACKUP ACTIVE' : 'NOT CONFIGURED'}
+                  </span>
+                </div>
+                {gitBackupStatus?.configured ? (
+                  <p className="git-backup-desc">
+                    Commits <code>backups/latest.json</code> and daily snapshots to private repository{' '}
+                    <code>{gitBackupStatus.repo}</code> on session stop/environment updates and daily schedule.
+                    {gitBackupStatus.lastSuccessAt && (
+                      <> Last saved: <strong>{new Date(gitBackupStatus.lastSuccessAt).toLocaleString()}</strong>.</>
+                    )}
+                    {gitBackupStatus.lastStatus === 'error' && gitBackupStatus.lastError && (
+                      <span className="git-backup-err"> Last error: {gitBackupStatus.lastError}</span>
+                    )}
+                  </p>
+                ) : (
+                  <p className="git-backup-desc">
+                    Create a dedicated <strong>private</strong> GitHub repository (e.g. <code>ptech8000/smarthouse-annotator-backups</code>) and set{' '}
+                    <code>GITHUB_BACKUP_REPO</code> + <code>GITHUB_BACKUP_TOKEN</code> in Vercel Project Settings → Environment Variables.
+                  </p>
+                )}
+              </div>
+              {gitBackupStatus?.configured && (
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-soft-blue"
+                  disabled={isPushingGitBackup}
+                  onClick={handlePushGitBackupNow}
+                >
+                  <RefreshCw size={14} />
+                  <span>{isPushingGitBackup ? 'Pushing...' : 'Push to Private Git Now'}</span>
+                </button>
+              )}
+            </div>
+          </section>
+
+          <section className="pro-section">
+            <div className="section-head-pro">
+              <div>
+                <h3>Environments Library ({environments.length})</h3>
+                <p>Create custom environments, download an environment's JSON file, or upload a JSON file to create a new environment</p>
+              </div>
+              <div className="section-head-actions">
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-secondary"
+                  onClick={() => directJsonInputRef.current?.click()}
+                  title="Upload a .json file to immediately create a new environment"
+                >
+                  <Upload size={15} />
+                  <span>Create from JSON Upload</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn-ui btn-ui-primary"
+                  onClick={() => {
+                    setEnvBuilderDraft(null);
+                    setShowEnvBuilder(true);
+                  }}
+                >
+                  <PlusCircle size={15} />
+                  <span>Create New Environment</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="env-cards-grid">
+              {environments.map(env => (
+                <div key={env.id} className={`env-library-card ${env.id === selectedEnvId ? 'env-selected' : ''}`}>
+                  <div className="env-card-top">
+                    <div>
+                      <div className="env-card-badges">
+                        <span className={`status-pill ${env.is_default ? 'pill-blue' : 'pill-active'}`}>
+                          {env.is_default ? 'BUILT-IN' : 'CUSTOM'}
+                        </span>
+                      </div>
+                      <h4 className="env-card-title">{env.name}</h4>
+                    </div>
+                    {!env.is_default && (
+                      <button
+                        type="button"
+                        className="btn-table btn-table-delete"
+                        onClick={() => handleDeleteEnvironment(env)}
+                        title={`Delete environment ${env.name}`}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    )}
+                  </div>
+
+                  {env.description && <p className="env-card-desc">{env.description}</p>}
+
+                  <div className="env-card-stats">
+                    <span><strong>{env.snapshot?.roles?.length || 0}</strong> roles</span>
+                    <span>•</span>
+                    <span><strong>{env.snapshot?.locations?.length || 0}</strong> rooms</span>
+                    <span>•</span>
+                    <span><strong>{env.snapshot?.activities?.length || 0}</strong> activities</span>
+                  </div>
+
+                  <div className="env-card-roles">
+                    {(env.snapshot?.roles || []).map(r => (
+                      <span key={r} className="badge-participant">{r}</span>
+                    ))}
+                  </div>
+
+                  <div className="env-card-actions">
+                    <button
+                      type="button"
+                      className="btn-ui btn-ui-soft-blue"
+                      onClick={() => {
+                        setSelectedEnvId(env.id);
+                        onTabChange?.('sessions');
+                        showFeedback(`Selected "${env.name}" for your next session.`, 'info', 'Environment Selected');
+                      }}
+                    >
+                      <Play size={13} />
+                      <span>Use for New Session</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ui btn-ui-secondary"
+                      onClick={() => handleDownloadEnvironmentJson(env.id, env.name)}
+                      title={`Download JSON file for ${env.name}`}
+                    >
+                      <Download size={13} />
+                      <span>Download JSON</span>
+                    </button>
+                    {env.snapshot && (
+                      <button
+                        type="button"
+                        className="btn-ui btn-ui-secondary"
+                        onClick={() => {
+                          setEnvBuilderDraft(snapshotToDraft(env.snapshot, `${env.name} Copy`));
+                          setShowEnvBuilder(true);
+                        }}
+                      >
+                        <CopyPlus size={13} />
+                        <span>Clone &amp; Edit</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="pro-section">
+            <div className="section-head-pro">
+              <div>
+                <h3>Active Configuration Snapshot &amp; Data Integrity {activeSessionObj ? `(${currentSessionId})` : '(Default Preset)'}</h3>
+                <p>
+                  {activeSessionObj
+                    ? `Frozen configuration snapshot active in session "${currentSessionId}" (${activeSessionObj.environment_name || 'Default Smart House'})`
+                    : 'Built-in Default Smart House configuration snapshot (no active session selected)'}
+                </p>
+              </div>
+              <button className="btn-ui btn-ui-secondary" onClick={handleReloadConfig}>
+                <RefreshCw size={14} />
+                <span>Reload Default JSONs</span>
+              </button>
+            </div>
+
+            <div className="config-summary-grid">
+              <div className="config-metric">
+                <span className="cfg-lbl">Config Version Hash</span>
+                <code>{config?.hash?.substring(0, 24)}...</code>
+              </div>
+              <div className="config-metric">
+                <span className="cfg-lbl">Rooms / Locations</span>
+                <strong>{config?.locations?.length || 0} locations</strong>
+              </div>
+              <div className="config-metric">
+                <span className="cfg-lbl">Activities Configured</span>
+                <strong>{config?.activities?.length || 0} activities</strong>
+              </div>
+              <div className="config-metric">
+                <span className="cfg-lbl">Residents</span>
+                <strong>{config?.residentNumber || 0} ({config?.roles?.join(', ')})</strong>
+              </div>
+            </div>
+          </section>
+
+          <section className="pro-section">
+            <div className="section-head-pro">
+              <div>
+                <h3>Default File Manifest (Built-In Smart House)</h3>
+                <p>Base JSON templates loaded from the repository root</p>
+              </div>
+            </div>
+
+            <div className="config-files-list">
+              <div className="config-file-row">
+                <FileText size={18} className="file-icon" />
+                <div>
+                  <strong>scenario.json</strong>
+                  <p>Active session roles: {config?.roles.join(', ')} ({config?.residentNumber} total)</p>
+                </div>
+                <CheckCircle2 size={18} className="file-ok-icon" />
+              </div>
+
+              <div className="config-file-row">
+                <FileText size={18} className="file-icon" />
+                <div>
+                  <strong>locations.json</strong>
+                  <p>{config?.locations.length} rooms mapped with normalized zoning</p>
+                </div>
+                <CheckCircle2 size={18} className="file-ok-icon" />
+              </div>
+
+              <div className="config-file-row">
+                <FileText size={18} className="file-icon" />
+                <div>
+                  <strong>activities.json &amp; activities_location.json</strong>
+                  <p>{config?.activities.length} activities mapped to rooms</p>
+                </div>
+                <CheckCircle2 size={18} className="file-ok-icon" />
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
+
+      <EnvironmentBuilderModal
+        isOpen={showEnvBuilder}
+        initialDraft={envBuilderDraft}
+        currentConfig={config}
+        onClose={() => setShowEnvBuilder(false)}
+        onCreated={async createdEnv => {
+          await loadEnvironments();
+          setSelectedEnvId(createdEnv.id);
+        }}
+      />
+    </div>
+  );
+};
