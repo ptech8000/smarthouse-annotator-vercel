@@ -297,12 +297,32 @@ function startPeriodicBackup(exportBackupFn, intervalMs = 6 * 60 * 60 * 1000) {
   periodicTimer.unref?.();
 }
 
+async function fetchLatestBackup({ fetchFn = global.fetch, env = process.env } = {}) {
+  const cfg = getConfig(env);
+  if (!cfg.configured) return null;
+  try {
+    const repoInfo = await verifyPrivateRepo(cfg, fetchFn);
+    const targetBranch = cfg.branch || repoInfo.default_branch || 'main';
+    const getUrl = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/backups/latest.json?ref=${encodeURIComponent(targetBranch)}`;
+    const res = await githubFetch(getUrl, { token: cfg.token, fetchFn });
+    if (res.status !== 200) return null;
+    const data = await res.json();
+    if (typeof data.content !== 'string') return null;
+    const decoded = Buffer.from(data.content.replace(/\s+/g, ''), 'base64').toString('utf8');
+    return JSON.parse(decoded);
+  } catch (err) {
+    console.warn('[GitBackup] Cold-start restore check warning:', err.message);
+    return null;
+  }
+}
+
 module.exports = {
   parseRepoSlug,
   getConfig,
   getStatus,
   verifyPrivateRepo,
   runBackupNow,
+  fetchLatestBackup,
   scheduleAutoBackup,
   startPeriodicBackup
 };

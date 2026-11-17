@@ -75,6 +75,12 @@ function ensureAppReady() {
       if (cachedConfig.valid) {
         await db.ensureDefaultEnvironment(cachedConfig.hash, cachedConfig.snapshot);
       }
+      if (IS_VERCEL && db.getStorageInfo().engine === 'sqlite' && gitBackup.getConfig().configured) {
+        const latestBackup = await gitBackup.fetchLatestBackup();
+        if (latestBackup && latestBackup.format === 'smarthouse-backup-v1') {
+          await db.restoreBackup(latestBackup).catch(() => {});
+        }
+      }
     })().catch(err => {
       bootstrapPromise = null;
       throw err;
@@ -127,13 +133,45 @@ async function triggerPrivateGitBackup(reason, delayMs = 30000, waitInlineOnServ
 // AUTHENTICATION HELPERS & MIDDLEWARE
 // ==========================================================================
 
+function getSigningSecret() {
+  return process.env.CRON_SECRET || process.env.ADMIN_PASSWORD || 'smarthouse-annotator-v2-secret';
+}
+
+function createSignedAdminToken(username, ttlMs) {
+  const exp = Date.now() + ttlMs;
+  const nonce = generateToken(12);
+  const payload = `${username}.${exp}.${nonce}`;
+  const sig = crypto.createHmac('sha256', getSigningSecret()).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+function verifySignedAdminToken(rawToken) {
+  if (typeof rawToken !== 'string') return null;
+  const parts = rawToken.split('.');
+  if (parts.length !== 4) return null;
+  const [username, expStr, nonce, sig] = parts;
+  const exp = Number(expStr);
+  if (!username || !exp || Number.isNaN(exp) || exp <= Date.now()) return null;
+  const payload = `${username}.${expStr}.${nonce}`;
+  const expected = crypto.createHmac('sha256', getSigningSecret()).update(payload).digest('hex');
+  try {
+    const a = Buffer.from(sig, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    return username;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveAdminAuth(req) {
   const cookies = parseCookies(req.headers.cookie);
   const rawSid = cookies[ADMIN_COOKIE_NAME];
   if (!rawSid) return null;
   const sessionRow = await db.getAdminSession(hashToken(rawSid));
-  if (!sessionRow) return null;
-  const user = await db.getAdminUser(sessionRow.username);
+  const verifiedUsername = sessionRow?.username || verifySignedAdminToken(rawSid);
+  if (!verifiedUsername) return null;
+  const user = await db.getAdminUser(verifiedUsername);
   if (!user) return null;
   return {
     username: user.username,
@@ -288,7 +326,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
-    const rawToken = generateToken(32);
+    const rawToken = createSignedAdminToken(user.username, TOKEN_TTL_MS);
     await db.createAdminSession(hashToken(rawToken), user.username, TOKEN_TTL_MS);
     setAdminCookie(req, res, rawToken);
 

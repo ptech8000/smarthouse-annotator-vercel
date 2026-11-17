@@ -39,7 +39,9 @@ function tbl(name) {
 
 const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
-  : path.join(__dirname, 'data');
+  : process.env.VERCEL
+    ? '/tmp/smarthouse-data'
+    : path.join(__dirname, 'data');
 
 let sqliteDb = null;
 let pgPool = null;
@@ -205,13 +207,6 @@ async function initializeDatabase() {
     }
     console.log(`[Database] Connected to PostgreSQL (schema "${PG_SCHEMA}").`);
   } else {
-    if (process.env.VERCEL) {
-      const err = new Error(
-        'PostgreSQL database not connected: set a valid DATABASE_URL (postgres://...) in Vercel Environment Variables (or attach Neon Postgres under Vercel Storage) and Redeploy.'
-      );
-      err.statusCode = 503;
-      throw err;
-    }
     const { DatabaseSync } = require('node:sqlite');
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
